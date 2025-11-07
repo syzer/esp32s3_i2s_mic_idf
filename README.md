@@ -1,6 +1,8 @@
 # WAT
 Stream microphone to audio, video and file.
 Works on Xiao Sense ESP32-S3 development board. See https://xiao.esp32.com/en/latest/hardware/sense.html for details.
+![spectrum](docs/spectrum.png)
+
 
 ## Quickstart
 0) install toolchain
