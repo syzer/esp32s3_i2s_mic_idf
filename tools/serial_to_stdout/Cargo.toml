@@ -1,0 +1,10 @@
+[package]
+name = "serial_to_stdout"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+serialport = "4"
+
+
