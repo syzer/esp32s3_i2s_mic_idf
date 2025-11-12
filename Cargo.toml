@@ -22,11 +22,21 @@ default = []
 
 experimental = ["esp-idf-svc/experimental"]
 
+# Optional feature for the websocket helper binary (adds async wifi, heapless, etc.)
+websocket = ["heapless", "embedded-svc", "esp-idf-hal", "tokio", "tokio-tungstenite", "once_cell", "futures-util", "tokio/time"]
+
 [dependencies]
 log = "0.4"
 esp-idf-svc = "0.51"
 anyhow = "1.0"
 esp-idf-sys = "0.36"
+heapless = { version = "0.8.0", optional = true }
+embedded-svc = { version = "0.28.1", features = ["experimental", "use_serde"], optional = true }
+esp-idf-hal = { version = "0.45.2", optional = true }
+tokio = { version = "1.39.3", features = ["rt", "macros", "net", "sync"], optional = true }
+tokio-tungstenite = { version = "0.20", optional = true }
+once_cell = { version = "1.20", optional = true }
+futures-util = { version = "0.3", optional = true }
 
 # --- Optional Embassy Integration ---
 # esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
@@ -47,3 +57,4 @@ esp-idf-sys = "0.36"
 
 [build-dependencies]
 embuild = "0.33"
+dotenvy = "0.15"

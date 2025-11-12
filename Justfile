@@ -3,7 +3,7 @@
 default: run-release
 
 run-release:
-	cargo run --release
+	cargo run --release --bin esp32s3_i2s_mic_idf
 
 s3-to-video-raw:
 	just serial-run | ffplay -f s16le -ar 16000 -i -
@@ -44,3 +44,12 @@ serial-run PORT='/dev/cu.usbmodem2101' BAUD='921600':
 s3-to-video-rust PORT='/dev/cu.usbmodem2101':
 	cargo run --manifest-path tools/serial_to_stdout/Cargo.toml --target x86_64-apple-darwin --release -- {{PORT}} \
 		| ffplay -f s16le -ar 16000 -i -
+
+run-websocket:
+	cargo run --bin run-websocket --features websocket
+
+play-websocket S3_IP='':
+	@if [ -z "{{S3_IP}}" ]; then \
+		echo "S3_IP is required. Set it like: S3_IP=192.168.94.111 just play-websocket"; exit 1; \
+	fi
+	websocat -b ws://{{S3_IP}}:9000 | play -t raw -r 16000 -e signed -b 16 -c 1 -

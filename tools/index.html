@@ -1,0 +1,135 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebSocket Audio Stream</title>
+  <style>body{font-family:sans-serif;padding:1rem} button{margin-right:.5rem}</style>
+</head>
+<body>
+  <h1>WebSocket Audio Stream</h1>
+  <p>Connects to ws://localhost:9000 (or change URL) and plays incoming 16kHz signed 16-bit little-endian PCM audio.</p>
+  <label>WebSocket URL: <input id="url" value="ws://192.168.94.111:9000"></label>
+  <div style="margin-top:.5rem">
+    <button id="connect">Connect & Play</button>
+    <button id="disconnect" disabled>Disconnect</button>
+    <span id="status" style="margin-left:1rem;color:gray">idle</span>
+  </div>
+
+  <script>
+    // Parameters
+    const SAMPLE_RATE = 16000; // Hz
+    const CHANNELS = 1; // mono
+
+    let ws = null;
+    let audioCtx = null;
+    let scriptNode = null;
+    let pcmQueue = [];
+
+    const statusEl = document.getElementById('status');
+    const connectBtn = document.getElementById('connect');
+    const disconnectBtn = document.getElementById('disconnect');
+    const urlInput = document.getElementById('url');
+
+    function setStatus(s, color='gray'){
+      statusEl.textContent = s;
+      statusEl.style.color = color;
+    }
+
+    function int16ArrayFromBuffer(buf){
+      // buf is ArrayBuffer or view of incoming bytes
+      return new Int16Array(buf.byteLength / 2).map((_, i) => {
+        const lo = new DataView(buf).getInt16(i*2, true);
+        return lo;
+      });
+    }
+
+    function connect(){
+      const url = urlInput.value;
+      ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        setStatus('connected', 'green');
+        connectBtn.disabled = true;
+        disconnectBtn.disabled = false;
+      };
+
+      ws.onmessage = (ev) => {
+        if (ev.data instanceof ArrayBuffer) {
+          // convert signed 16-bit little-endian PCM to Float32 for WebAudio
+          const data = new Int16Array(ev.data);
+          const floatBuf = new Float32Array(data.length);
+          for (let i = 0; i < data.length; i++) {
+            floatBuf[i] = data[i] / 32768; // normalize
+          }
+          pcmQueue.push(floatBuf);
+        }
+      };
+
+      ws.onclose = () => {
+        setStatus('disconnected', 'gray');
+        connectBtn.disabled = false;
+        disconnectBtn.disabled = true;
+      };
+
+      ws.onerror = (e) => {
+        console.error('WebSocket error', e);
+        setStatus('error', 'red');
+      };
+
+      // set up WebAudio on first connect
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: SAMPLE_RATE});
+
+        // ScriptProcessorNode is deprecated but widely supported; AudioWorklet is better but more setup
+        const bufferSize = 4096;
+        scriptNode = audioCtx.createScriptProcessor(bufferSize, 0, CHANNELS);
+
+        scriptNode.onaudioprocess = (audioProcessingEvent) => {
+          const outputBuffer = audioProcessingEvent.outputBuffer.getChannelData(0);
+
+          if (pcmQueue.length === 0) {
+            // output silence
+            for (let i = 0; i < outputBuffer.length; i++) outputBuffer[i] = 0;
+            return;
+          }
+
+          // stitch queued buffers if needed
+          let src = pcmQueue.shift();
+          let srcPos = 0;
+
+          for (let i = 0; i < outputBuffer.length; i++) {
+            if (srcPos >= src.length) {
+              if (pcmQueue.length > 0) {
+                src = pcmQueue.shift();
+                srcPos = 0;
+              } else {
+                outputBuffer[i] = 0;
+                continue;
+              }
+            }
+            outputBuffer[i] = src[srcPos++];
+          }
+        };
+
+        scriptNode.connect(audioCtx.destination);
+      }
+    }
+
+    function disconnect(){
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+      setStatus('idle', 'gray');
+    }
+
+    connectBtn.addEventListener('click', () => {
+      connect();
+      // resume audio context on user gesture
+      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    });
+    disconnectBtn.addEventListener('click', disconnect);
+  </script>
+</body>
+</html>
