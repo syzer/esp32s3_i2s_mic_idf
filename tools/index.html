@@ -14,6 +14,7 @@
     <button id="disconnect" disabled>Disconnect</button>
     <span id="status" style="margin-left:1rem;color:gray">idle</span>
   </div>
+  <div id="event-log" style="margin-top:1rem;font-family:monospace;background:#f7f7f7;padding:.5rem;max-height:200px;overflow:auto"></div>
 
   <script>
     // Parameters
@@ -24,15 +25,47 @@
     let audioCtx = null;
     let scriptNode = null;
     let pcmQueue = [];
+    let streamStartTime = null;
+    let lastDataTime = null;
+    let streamMonitor = null;
 
     const statusEl = document.getElementById('status');
     const connectBtn = document.getElementById('connect');
     const disconnectBtn = document.getElementById('disconnect');
     const urlInput = document.getElementById('url');
+    const logEl = document.getElementById('event-log');
 
     function setStatus(s, color='gray'){
       statusEl.textContent = s;
       statusEl.style.color = color;
+    }
+
+    function logEvent(message) {
+      const time = new Date().toLocaleString();
+      const entry = document.createElement('div');
+      entry.textContent = `[${time}] ${message}`;
+      logEl.appendChild(entry);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function resetStreamTracking() {
+      streamStartTime = null;
+      lastDataTime = null;
+    }
+
+    function ensureStreamMonitor() {
+      if (streamMonitor) return;
+      streamMonitor = setInterval(() => {
+        if (streamStartTime && lastDataTime) {
+          const now = Date.now();
+          if (now - lastDataTime > 1000) {
+            const durationMs = lastDataTime - streamStartTime;
+            const durationSec = (durationMs / 1000).toFixed(2);
+            logEvent(`stream ended at ${new Date(lastDataTime).toLocaleTimeString()} after ${durationSec}s`);
+            resetStreamTracking();
+          }
+        }
+      }, 1000);
     }
 
     function int16ArrayFromBuffer(buf){
@@ -52,10 +85,18 @@
         setStatus('connected', 'green');
         connectBtn.disabled = true;
         disconnectBtn.disabled = false;
+        logEvent('connected to websocket');
+        ensureStreamMonitor();
       };
 
       ws.onmessage = (ev) => {
         if (ev.data instanceof ArrayBuffer) {
+          const now = Date.now();
+          if (!streamStartTime) {
+            streamStartTime = now;
+            logEvent(`stream started at ${new Date(now).toLocaleTimeString()}`);
+          }
+          lastDataTime = now;
           // convert signed 16-bit little-endian PCM to Float32 for WebAudio
           const data = new Int16Array(ev.data);
           const floatBuf = new Float32Array(data.length);
@@ -70,6 +111,14 @@
         setStatus('disconnected', 'gray');
         connectBtn.disabled = false;
         disconnectBtn.disabled = true;
+        if (streamStartTime && lastDataTime) {
+          const durationMs = lastDataTime - streamStartTime;
+          const durationSec = (durationMs / 1000).toFixed(2);
+          logEvent(`connection closed; last stream lasted ${durationSec}s`);
+        } else {
+          logEvent('connection closed before stream data arrived');
+        }
+        resetStreamTracking();
       };
 
       ws.onerror = (e) => {
@@ -121,6 +170,9 @@
         ws.close();
         ws = null;
       }
+      connectBtn.disabled = false;
+      disconnectBtn.disabled = true;
+      resetStreamTracking();
       setStatus('idle', 'gray');
     }
 
