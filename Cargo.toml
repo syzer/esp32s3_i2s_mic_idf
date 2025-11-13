@@ -21,12 +21,17 @@ opt-level = "z"
 default = []
 
 experimental = ["esp-idf-svc/experimental"]
+websocket = []
 
 [dependencies]
 log = "0.4"
 esp-idf-svc = "0.51"
 anyhow = "1.0"
 esp-idf-sys = "0.36"
+embedded-websocket = "0.9.4"
+httparse = "1"
+embedded-svc = "0.28"
+heapless = "0.9.1"
 
 # --- Optional Embassy Integration ---
 # esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }

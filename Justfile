@@ -5,6 +5,16 @@ default: run-release
 run-release:
 	cargo run --release
 
+run-websocket:
+	cargo run --release --features websocket
+
+ws-hexdump S3_IP="":
+	@if [ -z "{{S3_IP}}" ]; then \
+		echo "Set S3_IP (e.g. S3_IP=192.168.68.122) before running this recipe."; \
+		exit 1; \
+	fi
+	websocat -b ws://{{S3_IP}}/audio | hexdump -C
+
 s3-to-video-raw:
 	just serial-run | ffplay -f s16le -ar 16000 -i -
 

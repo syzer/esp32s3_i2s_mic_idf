@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ESP32-S3 Audio Stream</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #111;
+      color: #f4f4f4;
+    }
+    main {
+      width: min(480px, 90vw);
+      padding: 1.5rem;
+      border-radius: 0.75rem;
+      background: #1d1d1d;
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+    }
+    h1 {
+      font-size: 1.25rem;
+      margin: 0 0 1rem;
+    }
+    label {
+      font-size: 0.9rem;
+      display: block;
+      margin-bottom: 0.35rem;
+    }
+    input {
+      width: 100%;
+      padding: 0.65rem;
+      border-radius: 0.5rem;
+      border: 1px solid #444;
+      background: #090909;
+      color: inherit;
+      font-size: 1rem;
+    }
+    button {
+      margin-top: 1rem;
+      width: 100%;
+      padding: 0.75rem;
+      border: none;
+      border-radius: 0.5rem;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      background: #00c853;
+      color: #fff;
+      transition: background 0.2s ease-in-out;
+    }
+    button[disabled] {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    button.disconnect {
+      background: #ff5252;
+    }
+    .status {
+      margin-top: 1rem;
+      font-size: 0.95rem;
+      min-height: 1.5rem;
+    }
+    .status span {
+      font-weight: 600;
+    }
+    .log {
+      margin-top: 1rem;
+      background: #000;
+      border-radius: 0.5rem;
+      padding: 0.75rem;
+      font-size: 0.85rem;
+      max-height: 8rem;
+      overflow-y: auto;
+      border: 1px solid #2b2b2b;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>ESP32-S3 WebSocket Audio</h1>
+    <label for="ip-input">Device IP (from `set -gx S3_IP ...`)</label>
+    <input id="ip-input" type="text" placeholder="192.168.68.122" value="192.168.68.122" />
+    <button id="connect-btn">Connect</button>
+    <div class="status">Status: <span id="status-text">idle</span></div>
+    <div class="log" id="log"></div>
+  </main>
+
+  <script>
+    const SAMPLE_RATE = 16000;
+    const statusText = document.getElementById("status-text");
+    const logBox = document.getElementById("log");
+    const ipInput = document.getElementById("ip-input");
+    const connectBtn = document.getElementById("connect-btn");
+
+    let ws = null;
+    let audioCtx = null;
+    let gainNode = null;
+    let nextPlayTime = 0;
+
+    function log(message) {
+      const stamp = new Date().toLocaleTimeString();
+      logBox.textContent = `[${stamp}] ${message}\n` + logBox.textContent;
+    }
+
+    function setStatus(text) {
+      statusText.textContent = text;
+    }
+
+    function ensureAudioContext() {
+      if (audioCtx && audioCtx.state !== "closed") {
+        return audioCtx;
+      }
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: SAMPLE_RATE,
+      });
+      gainNode = audioCtx.createGain();
+      gainNode.gain.value = 0.9;
+      gainNode.connect(audioCtx.destination);
+      nextPlayTime = audioCtx.currentTime;
+      return audioCtx;
+    }
+
+    function connect() {
+      const ip = ipInput.value.trim();
+      if (!ip) {
+        alert("Enter the ESP32-S3 IP from the build log banner.");
+        return;
+      }
+
+      ensureAudioContext();
+      if (audioCtx.state === "suspended") {
+        audioCtx.resume();
+      }
+
+      const url = `ws://${ip}/audio`;
+      ws = new WebSocket(url);
+      ws.binaryType = "arraybuffer";
+      setStatus(`connecting to ${url}`);
+      log(`Connecting to ${url}`);
+      connectBtn.textContent = "Disconnect";
+      connectBtn.classList.add("disconnect");
+
+      ws.onopen = () => {
+        setStatus(`connected (${url})`);
+        log("WebSocket connected");
+      };
+
+      ws.onmessage = (event) => {
+        if (!(event.data instanceof ArrayBuffer)) {
+          return;
+        }
+        handleAudioFrame(event.data);
+      };
+
+      ws.onerror = (err) => {
+        console.error(err);
+        log(`WebSocket error: ${err.message || err}`);
+      };
+
+      ws.onclose = () => {
+        log("WebSocket closed");
+        setStatus("disconnected");
+        connectBtn.textContent = "Connect";
+        connectBtn.classList.remove("disconnect");
+        ws = null;
+      };
+    }
+
+    function disconnect() {
+      if (ws) {
+        ws.close();
+      }
+      if (audioCtx) {
+        audioCtx.close();
+        audioCtx = null;
+      }
+      setStatus("disconnected");
+      connectBtn.textContent = "Connect";
+      connectBtn.classList.remove("disconnect");
+    }
+
+    function handleAudioFrame(buffer) {
+      if (!audioCtx) return;
+
+      const samples = new Int16Array(buffer);
+      const floatSamples = new Float32Array(samples.length);
+      for (let i = 0; i < samples.length; i++) {
+        floatSamples[i] = samples[i] / 32768;
+      }
+
+      const audioBuffer = audioCtx.createBuffer(1, floatSamples.length, SAMPLE_RATE);
+      audioBuffer.copyToChannel(floatSamples, 0);
+
+      const source = audioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(gainNode);
+
+      const now = audioCtx.currentTime;
+      if (nextPlayTime < now) {
+        nextPlayTime = now;
+      }
+      source.start(nextPlayTime);
+      nextPlayTime += audioBuffer.duration;
+    }
+
+    connectBtn.addEventListener("click", () => {
+      if (!ws || ws.readyState === WebSocket.CLOSED) {
+        connect();
+      } else {
+        disconnect();
+      }
+    });
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden && ws) {
+        log("Tab hidden -> disconnecting to save resources");
+        disconnect();
+      }
+    });
+  </script>
+</body>
+</html>
