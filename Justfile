@@ -46,10 +46,16 @@ s3-to-video-rust PORT='/dev/cu.usbmodem2101':
 		| ffplay -f s16le -ar 16000 -i -
 
 run-websocket:
-		cargo run --bin run-websocket --features websocket
+	cargo run --bin run-websocket --features websocket
 
 release-websocket:
 	cargo run --release --bin run-websocket --features websocket
+
+stream-hex S3_IP='':
+	@if [ -z "{{S3_IP}}" ]; then \
+		echo "S3_IP is required. Set it like: S3_IP=192.168.94.111 just stream-hex"; exit 1; \
+	fi
+	websocat -b ws://{{S3_IP}}:9000 | hexdump -C
 
 play-websocket S3_IP='':
 	@if [ -z "{{S3_IP}}" ]; then \

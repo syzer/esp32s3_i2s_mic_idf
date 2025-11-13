@@ -346,12 +346,15 @@ async fn handle_ws_connection(ws_stream: tokio_tungstenite::WebSocketStream<TcpS
     // Spawn a task to forward broadcasted PCM frames to the writer via out_tx
     let forward = {
         let out_tx = out_tx.clone();
+        let mut payload = Vec::with_capacity(fw::FRAME_BYTES);
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(frame_handle) => {
-                        let payload = frame_handle.as_slice().to_vec();
-                        if out_tx.send(Message::Binary(payload)).await.is_err() {
+                        payload.clear();
+                        let slice = frame_handle.as_slice();
+                        payload.extend_from_slice(slice);
+                        if out_tx.send(Message::Binary(payload.clone())).await.is_err() {
                             break;
                         }
                     }

@@ -58,6 +58,15 @@ Serving "." at http://127.0.0.1:8080
 
 3. Open the page in your browser and set the websocket URL to your running server (default in the page is `ws://localhost:9000`). Click "Connect & Play".
 
+Other handy commands:
+
+```
+just run-websocket          # run helper in dev mode
+just release-websocket      # run helper in release mode
+just stream-hex S3_IP=192.168.68.122  # dump raw PCM frames as hex via websocat|hexdump
+just play-websocket S3_IP=192.168.68.122  # pipe PCM into SoX play for quick listening
+```
+
 Notes about the audio format
 - Sample rate: 16000 Hz
 - Format: signed 16-bit little-endian (s16le)
@@ -68,4 +77,3 @@ If your websocket server uses a different URL or encoding, update `tools/index.h
 Troubleshooting
 - If the browser shows no audio, ensure the websocket server is running and sending binary ArrayBuffer messages containing s16le frames.
 - If you get a 404 for favicon (GET /favicon.ico 404) it's harmless.
-

@@ -31,6 +31,10 @@
     let lastDataTime = null;
     let streamMonitor = null;
     let playbackMode = 'pending'; // 'pending' | 'worklet' | 'script'
+    let manualDisconnect = false;
+    let reconnectTimer = null;
+    let socketGeneration = 0;
+    const RECONNECT_DELAY_MS = 2000;
 
     const statusEl = document.getElementById('status');
     const connectBtn = document.getElementById('connect');
@@ -41,6 +45,24 @@
     function setStatus(s, color='gray'){
       statusEl.textContent = s;
       statusEl.style.color = color;
+    }
+
+    function scheduleReconnect() {
+      if (manualDisconnect) return;
+      if (reconnectTimer) return;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        logEvent('attempting auto-reconnect...');
+        ensureAudioPipeline().then(() => connect(true));
+      }, RECONNECT_DELAY_MS);
+      setStatus('reconnecting...', 'orange');
+    }
+
+    function clearReconnectTimer() {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
     }
 
     function logEvent(message) {
@@ -66,6 +88,9 @@
             const durationSec = (durationMs / 1000).toFixed(2);
             logEvent(`stream ended at ${new Date(lastDataTime).toLocaleTimeString()} after ${durationSec}s`);
             resetStreamTracking();
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              setStatus('connected (waiting audio)', 'green');
+            }
           }
         }
       }, 1000);
@@ -156,38 +181,46 @@
       }
     }
 
-    function connect(){
+    function connect(auto = false){
       const url = urlInput.value;
-      ws = new WebSocket(url);
-      ws.binaryType = 'arraybuffer';
+      manualDisconnect = false;
+      clearReconnectTimer();
+      socketGeneration += 1;
+      const myGen = socketGeneration;
+      const socket = new WebSocket(url);
+      socket.binaryType = 'arraybuffer';
+      ws = socket;
 
-      ws.onopen = () => {
-        setStatus('connected', 'green');
+      socket.onopen = () => {
+        if (myGen !== socketGeneration) return;
+        setStatus('connected (waiting audio)', 'green');
         connectBtn.disabled = true;
         disconnectBtn.disabled = false;
-        logEvent('connected to websocket');
+        logEvent(auto ? 'auto-reconnected to websocket' : 'connected to websocket');
         ensureStreamMonitor();
       };
 
-      ws.onmessage = (ev) => {
+      socket.onmessage = (ev) => {
+        if (myGen !== socketGeneration) return;
         if (ev.data instanceof ArrayBuffer) {
           const now = Date.now();
           if (!streamStartTime) {
             streamStartTime = now;
             logEvent(`stream started at ${new Date(now).toLocaleTimeString()}`);
+            setStatus('streaming audio', 'green');
           }
           lastDataTime = now;
-          // convert signed 16-bit little-endian PCM to Float32 for WebAudio
           const data = new Int16Array(ev.data);
           const floatBuf = new Float32Array(data.length);
           for (let i = 0; i < data.length; i++) {
-            floatBuf[i] = data[i] / 32768; // normalize
+            floatBuf[i] = data[i] / 32768;
           }
           enqueueAudio(floatBuf);
         }
       };
 
-      ws.onclose = () => {
+      socket.onclose = () => {
+        if (myGen !== socketGeneration) return;
         setStatus('disconnected', 'gray');
         connectBtn.disabled = false;
         disconnectBtn.disabled = true;
@@ -199,18 +232,29 @@
           logEvent('connection closed before stream data arrived');
         }
         resetStreamTracking();
+        if (!manualDisconnect) {
+          scheduleReconnect();
+        }
       };
 
-      ws.onerror = (e) => {
+      socket.onerror = (e) => {
+        if (myGen !== socketGeneration) return;
         console.error('WebSocket error', e);
         setStatus('error', 'red');
+        if (!manualDisconnect) {
+          scheduleReconnect();
+        }
       };
-
     }
 
     function disconnect(){
       if (ws) {
-        ws.close();
+        manualDisconnect = true;
+        clearReconnectTimer();
+        socketGeneration += 1;
+        try {
+          ws.close();
+        } catch (_) {}
         ws = null;
       }
       connectBtn.disabled = false;
