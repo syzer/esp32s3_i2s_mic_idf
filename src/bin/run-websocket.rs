@@ -13,7 +13,8 @@ use esp_idf_svc::wifi::{AsyncWifi, EspWifi, WifiDriver};
 use embedded_svc::wifi::{ClientConfiguration, Configuration};
 use tokio::runtime::Builder as TokioBuilder;
 use tokio::sync::broadcast;
-use std::sync::Arc;
+use tokio::sync::broadcast::error::RecvError;
+use core::cell::UnsafeCell;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::accept_async;
 use std::net::SocketAddr;
@@ -37,9 +38,116 @@ impl Drop for NetworkStack {
     }
 }
 
-static PCM_SENDER: OnceCell<broadcast::Sender<Arc<Vec<u8>>>> = OnceCell::new();
+const FRAME_POOL_CAPACITY: usize = 64;
+const FRAME_BACKLOG: usize = 4;
+
+static PCM_SENDER: OnceCell<broadcast::Sender<FrameHandle>> = OnceCell::new();
 static FRAME_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PDM_STARTED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
+
+struct FrameSlot {
+    data: UnsafeCell<[u8; fw::FRAME_BYTES]>,
+    len: AtomicUsize,
+    refs: AtomicUsize,
+}
+
+unsafe impl Sync for FrameSlot {}
+
+impl FrameSlot {
+    const fn new() -> Self {
+        Self {
+            data: UnsafeCell::new([0; fw::FRAME_BYTES]),
+            len: AtomicUsize::new(0),
+            refs: AtomicUsize::new(0),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        let len = self.len.load(Ordering::Acquire);
+        unsafe { core::slice::from_raw_parts(self.data.get() as *const u8, len) }
+    }
+
+    fn as_mut_slice(&self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.data.get() as *mut u8, fw::FRAME_BYTES) }
+    }
+}
+
+const fn init_slots() -> [FrameSlot; FRAME_POOL_CAPACITY] {
+    const SLOT: FrameSlot = FrameSlot::new();
+    [SLOT; FRAME_POOL_CAPACITY]
+}
+
+static FRAME_SLOTS: [FrameSlot; FRAME_POOL_CAPACITY] = init_slots();
+
+fn acquire_slot(len: usize) -> Option<usize> {
+    if len > fw::FRAME_BYTES {
+        return None;
+    }
+    for idx in 0..FRAME_POOL_CAPACITY {
+        let slot = &FRAME_SLOTS[idx];
+        if slot
+            .refs
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            slot.len.store(0, Ordering::Release);
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn retain_slot(index: usize) {
+    FRAME_SLOTS[index].refs.fetch_add(1, Ordering::AcqRel);
+}
+
+fn release_slot(index: usize) {
+    let slot = &FRAME_SLOTS[index];
+    let prev = slot.refs.fetch_sub(1, Ordering::AcqRel);
+    if prev == 1 {
+        slot.len.store(0, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct FrameHandle {
+    index: usize,
+}
+
+impl Clone for FrameHandle {
+    fn clone(&self) -> Self {
+        retain_slot(self.index);
+        Self { index: self.index }
+    }
+}
+
+impl Drop for FrameHandle {
+    fn drop(&mut self) {
+        release_slot(self.index);
+    }
+}
+
+impl FrameHandle {
+    fn as_slice(&self) -> &[u8] {
+        FRAME_SLOTS[self.index].as_slice()
+    }
+}
+
+struct SubscriberGuard;
+
+impl SubscriberGuard {
+    fn new() -> Self {
+        ACTIVE_SUBSCRIBERS.fetch_add(1, Ordering::SeqCst);
+        SubscriberGuard
+    }
+}
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        ACTIVE_SUBSCRIBERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 fn main() -> Result<()> {
     // Link patches and init logging similarly to firmware main
@@ -81,7 +189,7 @@ fn main() -> Result<()> {
 
     // Create a broadcast channel for PCM frames (binary messages). We'll use a OnceCell
     // to make the sender available to the PDM sink which runs in an RTOS task.
-    let (tx, _rx) = broadcast::channel::<Arc<Vec<u8>>>(64);
+    let (tx, _rx_guard) = broadcast::channel::<FrameHandle>(FRAME_BACKLOG);
     PCM_SENDER.set(tx).ok();
 
     // Spawn a tiny background printer so serial shows whether frames are produced.
@@ -130,13 +238,6 @@ fn main() -> Result<()> {
                             match accept_async(stream).await {
                                 Ok(ws_stream) => {
                                     log::info!("Accepted WebSocket connection from {}", peer);
-                                    // Start PDM pipeline on first WebSocket client connect. This defers
-                                    // PDM startup so we can see whether PDM init causes network drops.
-                                    if !PDM_STARTED.swap(true, Ordering::SeqCst) {
-                                        log::info!("accept: starting PDM pipeline on first WS client");
-                                        // safety: start_pdm_with_stream runs an RTOS task and never returns
-                                        fw::start_pdm_with_stream(pdm_ws_stream as fw::StreamFn);
-                                    }
                                     tokio::spawn(handle_ws_connection(ws_stream, peer, tx));
                                 }
                                 Err(_) => {
@@ -165,39 +266,51 @@ fn main() -> Result<()> {
     loop { std::thread::sleep(Duration::from_millis(1000)); }
 }
 
+fn make_frame(samples: &[i16]) -> Option<FrameHandle> {
+    let len_bytes = samples.len() * core::mem::size_of::<i16>();
+    let idx = acquire_slot(len_bytes)?;
+    let slot = &FRAME_SLOTS[idx];
+    let buf = slot.as_mut_slice();
+    const GAIN: f32 = 2.0;
+    for (chunk, sample) in buf[..len_bytes].chunks_exact_mut(2).zip(samples.iter()) {
+        let scaled = (*sample as f32 * GAIN).round();
+        let clamped = if scaled > i16::MAX as f32 {
+            i16::MAX
+        } else if scaled < i16::MIN as f32 {
+            i16::MIN
+        } else {
+            scaled as i16
+        };
+        let u = clamped as u16;
+        chunk[0] = (u & 0xff) as u8;
+        chunk[1] = ((u >> 8) & 0xff) as u8;
+    }
+    slot.len.store(len_bytes, Ordering::Release);
+    Some(FrameHandle { index: idx })
+}
+
 // Stream function used by run-websocket. It must be `unsafe extern "C" fn(_,)->!`.
 unsafe extern "C" fn pdm_ws_stream(rx_channel: sys::i2s_chan_handle_t) -> ! {
     // TODO: implement forwarding to websocket clients here. For now just call the generic
     // stream_to_sink with a todo closure to keep the signature.
     // Try to publish PCM frames to the broadcast channel as binary messages (s16le).
     fw::stream_to_sink(rx_channel, |samples: &[i16]| {
-            if let Some(tx) = PCM_SENDER.get() {
-            // Apply a simple gain to the i16 samples before sending so the stream is louder.
-            // This uses a small fixed multiplier and clamps to the i16 range to avoid overflow.
-            const GAIN: f32 = 2.0; // 2x amplitude (~6dB). Adjust if you want more/less.
-
-            // Convert and scale samples into a u8 byte buffer (little-endian s16le)
-            let mut v = Vec::with_capacity(samples.len() * core::mem::size_of::<i16>());
-            for &s in samples.iter() {
-                // scale in float then clamp
-                let scaled = (s as f32 * GAIN).round();
-                let clamped = if scaled > i16::MAX as f32 {
-                    i16::MAX
-                } else if scaled < i16::MIN as f32 {
-                    i16::MIN
-                } else {
-                    scaled as i16
-                };
-                let u = clamped as u16;
-                v.push((u & 0xff) as u8);
-                v.push(((u >> 8) & 0xff) as u8);
+        if let Some(tx) = PCM_SENDER.get() {
+            if ACTIVE_SUBSCRIBERS.load(Ordering::Relaxed) == 0 {
+                return samples.len() as isize * core::mem::size_of::<i16>() as isize;
             }
-
-            // best-effort send, ignore lagging receivers
-            let arc = Arc::new(v);
-            let _ = tx.send(arc);
-            // record that a frame was produced
-            FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+            match make_frame(samples) {
+                Some(frame) => {
+                    if let Err(e) = tx.send(frame) {
+                        log::warn!("broadcast send failed: {}", e);
+                    } else {
+                        FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                None => {
+                    log::warn!("pcm frame pool exhausted; dropping frame");
+                }
+            }
             samples.len() as isize * core::mem::size_of::<i16>() as isize
         } else {
             0isize
@@ -205,8 +318,16 @@ unsafe extern "C" fn pdm_ws_stream(rx_channel: sys::i2s_chan_handle_t) -> ! {
     })
 }
 
-async fn handle_ws_connection(ws_stream: tokio_tungstenite::WebSocketStream<TcpStream>, peer: SocketAddr, tx: broadcast::Sender<Arc<Vec<u8>>>) {
+async fn handle_ws_connection(ws_stream: tokio_tungstenite::WebSocketStream<TcpStream>, peer: SocketAddr, tx: broadcast::Sender<FrameHandle>) {
     let mut rx = tx.subscribe();
+    let _sub_guard = SubscriberGuard::new();
+    if !PDM_STARTED.load(Ordering::SeqCst) {
+        if ACTIVE_SUBSCRIBERS.load(Ordering::SeqCst) == 1 {
+            log::info!("handle_ws_connection: starting PDM pipeline");
+            PDM_STARTED.store(true, Ordering::SeqCst);
+            fw::start_pdm_with_stream(pdm_ws_stream as fw::StreamFn);
+        }
+    }
     let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
     // mpsc channel for outgoing messages; writer task owns the WebSocket sink
@@ -226,10 +347,23 @@ async fn handle_ws_connection(ws_stream: tokio_tungstenite::WebSocketStream<TcpS
     let forward = {
         let out_tx = out_tx.clone();
         tokio::spawn(async move {
-            while let Ok(frame_arc) = rx.recv().await {
-                // Await send to apply backpressure per client instead of dropping frames.
-                if out_tx.send(Message::Binary(frame_arc.as_ref().to_vec())).await.is_err() {
-                    break;
+            loop {
+                match rx.recv().await {
+                    Ok(frame_handle) => {
+                        let payload = frame_handle.as_slice().to_vec();
+                        if out_tx.send(Message::Binary(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(skipped)) => {
+                        log::warn!(
+                            "ws forward: client {} lagged {} frames; continuing with latest data",
+                            peer,
+                            skipped
+                        );
+                        continue;
+                    }
+                    Err(RecvError::Closed) => break,
                 }
             }
         })
@@ -300,6 +434,7 @@ async fn connect_and_print_ip_keep_alive(ssid: String, pass: String) -> Result<N
     async_wifi.set_configuration(&Configuration::Client(client_config))
         .map_err(|e| anyhow!("connect: set_configuration failed: {}", e))?;
 
+    log::info!("connect: attempting to join SSID '{}'", ssid);
     log::info!("connect: starting wifi...");
     async_wifi.start().await.map_err(|e| anyhow!("connect: wifi start failed: {}", e))?;
 
@@ -346,13 +481,7 @@ async fn connect_and_print_ip_keep_alive(ssid: String, pass: String) -> Result<N
     if option_env!("SKIP_PDM") == Some("1") {
         log::info!("connect: SKIP_PDM=1; not starting PDM pipeline (debug mode)");
     } else {
-        // Only start PDM if it hasn't already been started elsewhere (e.g. on first WS connect).
-        if !PDM_STARTED.swap(true, Ordering::SeqCst) {
-            log::info!("connect: starting PDM pipeline...");
-            fw::start_pdm_with_stream(pdm_ws_stream as fw::StreamFn);
-        } else {
-            log::info!("connect: PDM pipeline already started; skipping start here");
-        }
+        log::info!("connect: deferring PDM start until first WebSocket client");
     }
     Ok(NetworkStack {
         event_loop,

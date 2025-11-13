@@ -6,7 +6,8 @@ pub const SAMPLE_RATE: u32 = 16_000;
 pub const DMA_DESC_NUM: u32 = 24;
 pub const DMA_FRAME_NUM: u32 = 512;
 pub const BUFFER_SAMPLES_PER_READ: usize = 512;
-pub const FRAME_BYTES: usize = 640; // 20 ms @ 16 kHz mono s16
+pub const FRAME_BYTES: usize = BUFFER_SAMPLES_PER_READ * core::mem::size_of::<i16>(); // 1024 bytes @ current settings
+
 
 // FreeRTOS task configuration
 pub const TASK_STACK_WORDS: u32 = 8192; // stack in 32-bit words

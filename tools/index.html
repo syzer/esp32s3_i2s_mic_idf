@@ -8,7 +8,7 @@
 <body>
   <h1>WebSocket Audio Stream</h1>
   <p>Connects to ws://localhost:9000 (or change URL) and plays incoming 16kHz signed 16-bit little-endian PCM audio.</p>
-  <label>WebSocket URL: <input id="url" value="ws://192.168.94.111:9000"></label>
+  <label>WebSocket URL: <input id="url" value="ws://192.168.68.122:9000"></label>
   <div style="margin-top:.5rem">
     <button id="connect">Connect & Play</button>
     <button id="disconnect" disabled>Disconnect</button>
@@ -24,10 +24,13 @@
     let ws = null;
     let audioCtx = null;
     let scriptNode = null;
+    let workletNode = null;
+    let audioSetupPromise = null;
     let pcmQueue = [];
     let streamStartTime = null;
     let lastDataTime = null;
     let streamMonitor = null;
+    let playbackMode = 'pending'; // 'pending' | 'worklet' | 'script'
 
     const statusEl = document.getElementById('status');
     const connectBtn = document.getElementById('connect');
@@ -68,12 +71,89 @@
       }, 1000);
     }
 
-    function int16ArrayFromBuffer(buf){
-      // buf is ArrayBuffer or view of incoming bytes
-      return new Int16Array(buf.byteLength / 2).map((_, i) => {
-        const lo = new DataView(buf).getInt16(i*2, true);
-        return lo;
-      });
+    function ensureAudioContext() {
+      if (!audioCtx) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        audioCtx = new Ctx({ sampleRate: SAMPLE_RATE });
+      }
+      return audioCtx;
+    }
+
+    function setupScriptProcessor() {
+      if (scriptNode) return;
+      ensureAudioContext();
+      const bufferSize = 4096;
+      scriptNode = audioCtx.createScriptProcessor(bufferSize, 0, CHANNELS);
+
+      scriptNode.onaudioprocess = (audioProcessingEvent) => {
+        const outputBuffer = audioProcessingEvent.outputBuffer.getChannelData(0);
+
+        if (pcmQueue.length === 0) {
+          for (let i = 0; i < outputBuffer.length; i++) outputBuffer[i] = 0;
+          return;
+        }
+
+        let src = pcmQueue.shift();
+        let srcPos = 0;
+
+        for (let i = 0; i < outputBuffer.length; i++) {
+          if (srcPos >= src.length) {
+            if (pcmQueue.length > 0) {
+              src = pcmQueue.shift();
+              srcPos = 0;
+            } else {
+              outputBuffer[i] = 0;
+              continue;
+            }
+          }
+          outputBuffer[i] = src[srcPos++];
+        }
+      };
+
+      scriptNode.connect(audioCtx.destination);
+      playbackMode = 'script';
+      logEvent('AudioWorklet unavailable; using ScriptProcessorNode fallback');
+    }
+
+    async function setupAudioWorklet() {
+      ensureAudioContext();
+      if (!audioCtx.audioWorklet) {
+        throw new Error('AudioWorklet not supported in this context');
+      }
+      if (workletNode) return;
+      await audioCtx.audioWorklet.addModule('pcm-player-worklet.js');
+      workletNode = new AudioWorkletNode(audioCtx, 'pcm-player-processor', { numberOfOutputs: CHANNELS });
+      workletNode.connect(audioCtx.destination);
+      playbackMode = 'worklet';
+      logEvent('AudioWorkletNode active');
+      // flush any queued buffers collected before worklet was ready
+      while (pcmQueue.length > 0) {
+        const buf = pcmQueue.shift();
+        workletNode.port.postMessage(buf, [buf.buffer]);
+      }
+    }
+
+    async function ensureAudioPipeline() {
+      if (workletNode || scriptNode) return;
+      if (!audioSetupPromise) {
+        audioSetupPromise = (async () => {
+          try {
+            await setupAudioWorklet();
+          } catch (err) {
+            console.warn('AudioWorklet unavailable, falling back to ScriptProcessorNode', err);
+            setupScriptProcessor();
+          }
+        })();
+      }
+      return audioSetupPromise;
+    }
+
+    function enqueueAudio(floatBuf) {
+      if (workletNode) {
+        workletNode.port.postMessage(floatBuf, [floatBuf.buffer]);
+      } else {
+        pcmQueue.push(floatBuf);
+      }
     }
 
     function connect(){
@@ -103,7 +183,7 @@
           for (let i = 0; i < data.length; i++) {
             floatBuf[i] = data[i] / 32768; // normalize
           }
-          pcmQueue.push(floatBuf);
+          enqueueAudio(floatBuf);
         }
       };
 
@@ -126,43 +206,6 @@
         setStatus('error', 'red');
       };
 
-      // set up WebAudio on first connect
-      if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: SAMPLE_RATE});
-
-        // ScriptProcessorNode is deprecated but widely supported; AudioWorklet is better but more setup
-        const bufferSize = 4096;
-        scriptNode = audioCtx.createScriptProcessor(bufferSize, 0, CHANNELS);
-
-        scriptNode.onaudioprocess = (audioProcessingEvent) => {
-          const outputBuffer = audioProcessingEvent.outputBuffer.getChannelData(0);
-
-          if (pcmQueue.length === 0) {
-            // output silence
-            for (let i = 0; i < outputBuffer.length; i++) outputBuffer[i] = 0;
-            return;
-          }
-
-          // stitch queued buffers if needed
-          let src = pcmQueue.shift();
-          let srcPos = 0;
-
-          for (let i = 0; i < outputBuffer.length; i++) {
-            if (srcPos >= src.length) {
-              if (pcmQueue.length > 0) {
-                src = pcmQueue.shift();
-                srcPos = 0;
-              } else {
-                outputBuffer[i] = 0;
-                continue;
-              }
-            }
-            outputBuffer[i] = src[srcPos++];
-          }
-        };
-
-        scriptNode.connect(audioCtx.destination);
-      }
     }
 
     function disconnect(){
@@ -176,7 +219,8 @@
       setStatus('idle', 'gray');
     }
 
-    connectBtn.addEventListener('click', () => {
+    connectBtn.addEventListener('click', async () => {
+      await ensureAudioPipeline();
       connect();
       // resume audio context on user gesture
       if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
