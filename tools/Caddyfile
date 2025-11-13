@@ -1,0 +1,22 @@
+:8080 {
+	root * .
+	file_server
+
+	@ws {
+		header Connection *Upgrade*
+		header Upgrade websocket
+		path /audio
+	}
+
+	@ws_cf {
+		header X-Forwarded-For *
+		path /audio
+	}
+
+	reverse_proxy @ws_cf http://{$S3_IP}:80 {
+		header_up Host {$S3_IP}
+		header_up X-Forwarded-Host {$S3_IP}
+	}
+
+	reverse_proxy @ws http://{$S3_IP}:80
+}

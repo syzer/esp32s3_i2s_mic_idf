@@ -42,8 +42,18 @@ The firmware also exposes the PCM stream over Wi-Fi via a websocket endpoint (`/
 3. After the device acquires DHCP it prints a banner like `=== set -gx S3_IP 192.168.68.122 ===`. Export that IP for your shell (e.g. `export S3_IP=192.168.68.122` or copy the `set -gx` command if you use fish).
 4. You can now:
    - Open `tools/index.html` in a browser and connect using the IP (plays audio via Web Audio).
+     When accessing via a Cloudflare tunnel, viewers can leave the host field blank so the page reuses the tunnel host automatically.
    - Or inspect the raw PCM frames from your terminal:
      ```
      just ws-hexdump S3_IP=$S3_IP
      ```
      (Requires [`websocat`](https://github.com/vi/websocat) on your host.)
+
+### Sharing the demo via Cloudflare
+Serve the UI through Caddy and expose it using Cloudflare Tunnels (requires `caddy` and `cloudflared` on your host):
+
+```
+just preview S3_IP=$S3_IP
+```
+
+The command runs Caddy with `tools/Caddyfile` (which proxies `/audio` to the board) and launches `cloudflared tunnel --url http://127.0.0.1:8080`. Share the generated `https://*.trycloudflare.com` URL so others can interact with your ESP32 stream remotely.
